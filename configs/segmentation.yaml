@@ -1,0 +1,245 @@
+# =============================================================================
+# 語意分割預設設定：DeepLabV3+ + ResNet-50（ImageNet 預訓練，output stride 16）
+#
+#   python -m src.train --config configs/segmentation.yaml
+#   python -m src.train --config configs/segmentation.yaml optim.lr=0.005 data.batch_size=4   # 命令列覆寫
+#
+# 寫法說明
+#   - 每個欄位都已列出並設成預設值，旁邊註解說明意義與可選值。
+#   - 欄位定義在 src/config.py；這裡打錯名稱或型別不符，啟動時會直接報錯。
+#   - null 代表「不設定」；列表可寫成 [1, 2, 3]。
+#   - 檔案最後有「常見組合」，示範如何換成 DINOv2 linear probe、ViT + FPN 等。
+#
+# 以 Colab T4（16GB）、fp16 為基準。
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# experiment：實驗本身的資訊與輸出位置
+# -----------------------------------------------------------------------------
+experiment:
+  name: seg_deeplabv3plus_resnet50   # 實驗名稱，輸出放在 <output_root>/<name>/
+                                     # ⚠ 同名稱會自動接著舊 checkpoint 續訓；換了模型或設定想重新訓練，請改名稱
+  task: semantic_seg            # detection（物件偵測）| semantic_seg（語意分割）
+  seed: 42                      # 亂數種子：決定資料順序、資料增強、模型初始化
+  output_root: /content/drive/MyDrive/VisionFromScratch/outputs
+                                # 所有輸出（checkpoint、TensorBoard、設定快照）的根目錄
+                                # 在 Colab 請指向 Google Drive，斷線才不會遺失
+
+
+# -----------------------------------------------------------------------------
+# data：資料集、DataLoader 與資料增強
+# -----------------------------------------------------------------------------
+data:
+  root: /content/data/VOC0712/VOC_dataset/VOCdevkit
+                                # VOCdevkit 目錄（底下有 VOC2007/、VOC2012/）
+  train_sets:                   # 訓練用的「年份 + 切分」，可列多組，會合併成一個資料集
+    - {year: "2012", split: train}      # 讀 VOC2012/ImageSets/Segmentation/train.txt，1,464 張
+  val_sets:                     # 評估用的切分
+    - {year: "2012", split: val}        # VOC2012 val 1,449 張
+                                        # ⚠ 不要用 VOC2007 test：VOC2012 分割資料含有那些圖，會資料洩漏
+  use_difficult: false          # 只有偵測使用，分割會忽略
+  batch_size: 8                 # 訓練 batch 大小；顯存不足（CUDA out of memory）就調小
+  val_batch_size: 4             # 評估 batch 大小（評估用原圖，尺寸比訓練裁切大）
+  num_workers: 2                # 讀圖的子行程數量；Colab 只有 2 顆 CPU，設 2 即可，除錯時可設 0
+  pin_memory: true              # 加快 CPU → GPU 的傳輸，通常保持 true
+  val_max_samples: null         # 訓練中的定期評估只跑前 N 張；null = 每次都跑完整驗證集
+                                # 分割驗證集只有 1,449 張，建議每次都跑完整的
+
+  augment:                      # 資料增強（只在訓練時套用；評估時使用原圖）
+    hflip_prob: 0.5             # 水平翻轉的機率；0 = 不翻轉
+    photometric: true           # 隨機調整亮度、對比、飽和度、色相
+    base_size: 512              # 隨機縮放的基準短邊長度
+    scale_range: [0.5, 2.0]     # 短邊隨機縮放到 base_size × [0.5, 2.0] 之間，也就是 256–1024
+    crop_size: 480              # 縮放後隨機裁切成 480×480；圖不夠大時補邊（補的部分不計 loss）
+                                # 越大看得越完整，但越慢、越吃顯存；ViT 建議設成 patch 大小的倍數
+    # 以下欄位只有偵測會用到，分割會忽略（設定方式見 configs/detection.yaml）：
+    # min_size、max_size、test_min_size
+
+
+# -----------------------------------------------------------------------------
+# model：模型 = backbone（擷取特徵）→ neck（整理特徵）→ head（輸出答案）
+# -----------------------------------------------------------------------------
+model:
+  # ---- backbone：從影像擷取特徵的主幹網路，使用 timm 的預訓練模型 ----
+  backbone:
+    name: resnet50.a1_in1k      # timm 模型名稱，「.」後面是權重版本，例如：
+                                #   CNN：  resnet50.a1_in1k、resnet50.tv2_in1k、resnet101.a1h_in1k
+                                #          convnext_tiny.fb_in22k_ft_in1k、efficientnet_b3.ra2_in1k
+                                #   ViT：  vit_small_patch16_224.dino（DINO）
+                                #          vit_small_patch14_dinov2.lvd142m（DINOv2）
+                                #          vit_small_patch16_dinov3.lvd1689m（DINOv3）
+                                #   自監督 CNN：convnext_tiny.dinov3_lvd1689m
+                                # 查詢可用權重：python -c "import timm; print(timm.list_pretrained('*resnet*'))"
+    pretrained: true            # 是否下載 timm 預訓練權重；VOC 資料量小，強烈建議 true
+    checkpoint: null            # 外部權重（本機路徑或 URL），用於 timm 沒有的權重，例如 DINO ResNet-50：
+                                #   https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth
+                                # 設定後會忽略 pretrained
+    checkpoint_key: null        # 權重存在外部 checkpoint 的哪個 key 底下，例如 teacher、model；null = 整個檔案就是權重
+    out_indices: [1, 4]         # 要輸出哪幾個 stage 的特徵（CNN 共 5 個，索引 0–4）
+                                #   索引：   0     1     2     3     4
+                                #   stride：2     4     8     16    32   （特徵圖比原圖縮小的倍數）
+                                #   ResNet-50 通道數：64、256、512、1024、2048
+                                # DeepLabV3+ 只需要兩層：第一層（stride 4）補細節、最後一層給 ASPP 抓語意
+                                # fpn_seg 通常用 [1, 2, 3, 4]
+                                # ViT 只有一種 stride，索引代表第幾個 block，例如 ViT-S 共 12 個 block，最後一個是 [11]
+    freeze: false               # true = 凍結整個 backbone 只訓練 head（linear probe 用）
+    freeze_bn: false            # 把 BatchNorm 固定成預訓練時的統計值
+                                # 分割 batch 8 且尺寸固定，BN 可以正常訓練，所以 false
+    mean: null                  # 影像正規化（(影像 - mean) / std）用的平均值與標準差
+    std: null                   # ⚠ 一定會做正規化，只是在模型內部做（資料管線輸出 [0, 1] 的影像）
+                                # null = 自動採用預訓練權重當初訓練時的數值，例如：
+                                #   ImageNet / DINO 系列：mean [0.485, 0.456, 0.406]、std [0.229, 0.224, 0.225]
+                                #   augreg ViT：         mean [0.5, 0.5, 0.5]、        std [0.5, 0.5, 0.5]
+                                # 只有用 checkpoint 載入外部權重時，timm 不知道數值，才需要手動填
+    kwargs:                     # 其他直接傳給 timm.create_model 的參數
+      output_stride: 16         # CNN 最後一個 stage 改用 dilation（空洞卷積）不再縮小，
+                                # stride 從 32 變 16，特徵圖較大、細節較多（DeepLab 標準作法）；8 更準但更慢
+      # drop_path_rate: 0.1     # 隨機丟棄殘差分支，ViT / ConvNeXt 常用的正則化
+
+  # ---- neck：把 backbone 的特徵整理成 head 需要的格式 ----
+  neck:
+    name: none                  # none | fpn | simple_pyramid
+                                #   none           不處理，直接把 backbone 特徵交給 head（deeplabv3plus、linear 用）
+                                #   fpn            Feature Pyramid Network：把 CNN 不同 stride 的特徵由粗到細融合，
+                                #                  並統一通道數（CNN + fpn_seg 用）
+                                #   simple_pyramid ViTDet 作法：用反卷積放大、池化縮小，
+                                #                  從 ViT 單一 stride 的特徵做出多種 stride（ViT + fpn_seg 用）
+    out_channels: 256           # fpn / simple_pyramid 輸出每一層的通道數
+    extra_levels: none          # 在最粗的一層後再加層（none | maxpool | p6p7）；那是給偵測抓大物體用的，分割保持 none
+    scales: [4.0, 2.0, 1.0, 0.5]
+                                # 只有 simple_pyramid 使用：對 ViT 特徵的縮放倍率，每個值產生一層
+                                #   4 = 放大 4 倍、2 = 放大 2 倍、1 = 原尺寸、0.5 = 縮小一半
+
+  # ---- head：根據特徵輸出最終答案（分割 = 每個像素屬於哪一類） ----
+  head:
+    name: deeplabv3plus         # deeplabv3plus | fpn_seg | linear
+                                #   deeplabv3plus  ASPP 用多種感受野抓周圍語境，再和淺層特徵結合還原邊緣。
+                                #                  經典、穩定，推薦入門
+                                #   fpn_seg        Semantic FPN：各層特徵放大到相同尺寸後相加再分類，需要 fpn / simple_pyramid
+                                #   linear         只有 BatchNorm + 1×1 卷積，幾乎沒有可學習的結構，
+                                #                  搭配 freeze: true 用來測試 backbone 特徵本身的品質（linear probe）
+    num_classes: 21             # 類別數 = VOC 20 類 + 背景 1 類，換資料集才需要改
+    kwargs:                     # head 的額外參數；⚠ 各 head 可用的參數不同，換 head 時要一起改
+      aspp_channels: 256        # deeplabv3plus：ASPP 各分支的通道數
+      aspp_rates: [6, 12, 18]   # deeplabv3plus：ASPP 三個空洞卷積的 dilation（output_stride 8 時建議 [12, 24, 36]）
+      low_level_channels: 48    # deeplabv3plus：淺層特徵壓縮後的通道數
+      # ---- fpn_seg 可用的參數 ----
+      # channels: 128           # 每層特徵統一成的通道數
+      # ---- linear 沒有額外參數，請設 kwargs: {} ----
+
+
+# -----------------------------------------------------------------------------
+# optim：優化器（怎麼依梯度更新權重）
+# -----------------------------------------------------------------------------
+optim:
+  name: sgd                     # sgd | adam | adamw
+                                #   sgd    CNN 偵測／分割的傳統選擇，搭配 momentum
+                                #   adamw  ViT 與 Transformer 類模型的標準選擇
+  lr: 0.01                      # 學習率；SGD 分割常用 0.01，AdamW 通常 1e-4 左右（linear probe 可到 1e-3）
+  weight_decay: 1.0e-4          # 權重衰減（L2 正則化）；SGD 常用 1e-4，AdamW 常用 0.05
+  momentum: 0.9                 # 只有 sgd 使用：沿用前幾步更新方向的比例
+  nesterov: false               # 只有 sgd 使用：Nesterov momentum
+  betas: [0.9, 0.999]           # 只有 adam / adamw 使用：一階、二階動量的衰減率
+  eps: 1.0e-8                   # 只有 adam / adamw 使用：避免除以 0 的小常數
+  backbone_lr_mult: 1.0         # backbone 的學習率 = lr × 此倍率
+                                # 預訓練權重已經很好，可設 0.1 讓 backbone 少變動（微調 ViT 常用）
+  no_weight_decay_norm_bias: true
+                                # norm 層、bias、ViT 位置編碼不做 weight decay（常見作法，通常保持 true）
+
+
+# -----------------------------------------------------------------------------
+# scheduler：學習率排程（學習率隨訓練進度怎麼變化），全部以 optimizer step 計算
+# -----------------------------------------------------------------------------
+scheduler:
+  name: poly                    # constant | cosine | multistep | step | poly
+                                #   constant   固定不變
+                                #   cosine     依餘弦曲線平滑下降到 min_lr_ratio
+                                #   multistep  到 milestones 時乘上 gamma（偵測的經典作法）
+                                #   step       每隔 step_size 乘上 gamma
+                                #   poly       (1 - 進度)^power 下降（分割的經典作法）
+  warmup_steps: 500             # 前 N 步學習率從 lr × warmup_start_factor 線性升到 lr，避免一開始梯度太大
+  warmup_start_factor: 0.001    # warmup 起始倍率
+  min_lr_ratio: 0.0             # cosine / poly 使用：最後的學習率 = lr × 此值
+  milestones: [0.67, 0.89]      # multistep 使用：在總 step 的 67%、89% 時降學習率（用比例，改訓練長度不必重算）
+  step_size: 0.33               # step 使用：每隔總 step 的 33% 降一次
+  gamma: 0.1                    # multistep / step 使用：每次降學習率乘上的倍率
+  power: 0.9                    # poly 使用：指數
+
+
+# -----------------------------------------------------------------------------
+# train：訓練迴圈
+# -----------------------------------------------------------------------------
+train:
+  max_steps: 15000              # 總訓練步數（一步 = 一次權重更新）；設定後會忽略 max_epochs
+                                # batch 8：每 epoch 約 183 步，15,000 步約 82 epoch
+  max_epochs: null              # 總訓練 epoch 數（一個 epoch = 所有訓練圖片看過一遍）
+  grad_accum_steps: 1           # 梯度累積：累積 N 個 batch 才更新一次，等效 batch = batch_size × N
+                                # 顯存不夠又想要大 batch 時使用（例如 batch_size 4 + accum 2 ≈ batch 8）
+  grad_clip_norm: 10.0          # 梯度範數上限，防止梯度爆炸；null = 不限制。ViT 常用 1.0
+  precision: fp16               # fp16 | bf16 | fp32
+                                #   fp16  混合精度，快且省顯存，T4 請用這個
+                                #   bf16  數值較穩，但需要 A100 / L4 等新 GPU（T4 設了會自動改 fp16）
+                                #   fp32  全精度，最慢，除錯用
+  log_every_steps: 20           # 每 N 步寫一次 loss、學習率到 TensorBoard 與畫面
+  eval_every_steps: 1500        # 每 N 步評估一次
+  cudnn_benchmark: true         # 讓 cuDNN 針對輸入尺寸挑最快的演算法；分割訓練裁切尺寸固定，開啟可加速
+  device: auto                  # auto（有 GPU 就用）| cuda | cpu
+
+
+# -----------------------------------------------------------------------------
+# checkpoint：存檔與續訓
+# -----------------------------------------------------------------------------
+checkpoint:
+  save_every_steps: 500         # 每 N 步存一次 checkpoint 到 <output_root>/<name>/checkpoints/
+  keep_last: 3                  # 只保留最新的 N 個（每個約 200–500MB，注意 Drive 空間）
+  resume: auto                  # auto  啟動時自動找最新的 checkpoint 接著訓練，沒有就從頭開始
+                                # none  永遠從頭開始（建議同時改 experiment.name，以免和舊的 checkpoint 混在一起）
+                                # 或填 checkpoint 路徑，從指定的檔案續訓
+  save_best: true               # 另外存一份指標最好的模型 best.pt
+  monitor: val/mIoU             # 用哪個指標決定 best：val/mIoU | val/mAcc | val/pixel_acc
+  monitor_mode: max             # max = 越大越好 | min = 越小越好
+  local_tmp_dir: null           # 存檔時先寫到這個本機目錄再複製到 Drive；null = 系統暫存目錄
+
+
+# -----------------------------------------------------------------------------
+# logging：TensorBoard 視覺化
+# -----------------------------------------------------------------------------
+logging:
+  num_vis_samples: 4            # 每次評估時，畫幾張「原圖 | 標註 | 預測」到 TensorBoard（val_vis/）
+
+
+# =============================================================================
+# 常見組合：要換模型時，把下面對應的設定改到上面（或用命令列覆寫）
+# 換組合時記得同時改 experiment.name，避免接到舊實驗的 checkpoint
+# =============================================================================
+#
+# 【Semantic FPN + ResNet-50】
+#   model.backbone.out_indices: [1, 2, 3, 4]
+#   model.backbone.kwargs: {}                      # 不需要 output_stride
+#   model.neck.name: fpn
+#   model.head.name: fpn_seg
+#   model.head.kwargs: {channels: 128}
+#
+# 【DINOv2 ViT-S/14 linear probe】（凍結 backbone，只訓練 head，T4 上很快）
+#   data.augment.crop_size: 448                    # 448 = 14 × 32，ViT patch 14 的倍數
+#   model.backbone.name: vit_small_patch14_dinov2.lvd142m
+#   model.backbone.out_indices: [8, 9, 10, 11]     # 最後 4 個 block 串接，比只取最後一層好
+#   model.backbone.freeze: true
+#   model.backbone.kwargs: {}
+#   model.head.name: linear
+#   model.head.kwargs: {}
+#   optim: {name: adamw, lr: 1.0e-3, weight_decay: 1.0e-4}
+#   scheduler.name: cosine
+#   train.max_steps: 8000
+#
+# 【DINOv3 ViT-S/16 + Simple Feature Pyramid + Semantic FPN】（完整微調）
+#   model.backbone.name: vit_small_patch16_dinov3.lvd1689m
+#   model.backbone.out_indices: [11]
+#   model.backbone.kwargs: {drop_path_rate: 0.1}
+#   model.neck.name: simple_pyramid                # scales [4, 2, 1, 0.5] → stride 4/8/16/32
+#   model.head.name: fpn_seg
+#   model.head.kwargs: {channels: 128}
+#   optim: {name: adamw, lr: 1.0e-4, weight_decay: 0.05, backbone_lr_mult: 0.1}
+#   scheduler.name: cosine
+#   train.grad_clip_norm: 1.0

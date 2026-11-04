@@ -1,0 +1,272 @@
+# =============================================================================
+# 物件偵測預設設定：FCOS + ResNet-50（ImageNet 預訓練）+ FPN
+#
+#   python -m src.train --config configs/detection.yaml
+#   python -m src.train --config configs/detection.yaml optim.lr=0.005 data.batch_size=4   # 命令列覆寫
+#
+# 寫法說明
+#   - 每個欄位都已列出並設成預設值，旁邊註解說明意義與可選值。
+#   - 欄位定義在 src/config.py；這裡打錯名稱或型別不符，啟動時會直接報錯。
+#   - null 代表「不設定」；列表可寫成 [1, 2, 3]。
+#   - 檔案最後有「常見組合」，示範如何換成 Faster R-CNN、DINO、ViT 等。
+#
+# 以 Colab T4（16GB）、fp16 為基準。
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# experiment：實驗本身的資訊與輸出位置
+# -----------------------------------------------------------------------------
+experiment:
+  name: det_fcos_resnet50       # 實驗名稱，輸出放在 <output_root>/<name>/
+                                # ⚠ 同名稱會自動接著舊 checkpoint 續訓；換了模型或設定想重新訓練，請改名稱
+  task: detection               # detection（物件偵測）| semantic_seg（語意分割）
+  seed: 42                      # 亂數種子：決定資料順序、資料增強、模型初始化
+  output_root: /content/drive/MyDrive/VisionFromScratch/outputs
+                                # 所有輸出（checkpoint、TensorBoard、設定快照）的根目錄
+                                # 在 Colab 請指向 Google Drive，斷線才不會遺失
+
+
+# -----------------------------------------------------------------------------
+# data：資料集、DataLoader 與資料增強
+# -----------------------------------------------------------------------------
+data:
+  root: /content/data/VOC0712/VOC_dataset/VOCdevkit
+                                # VOCdevkit 目錄（底下有 VOC2007/、VOC2012/）
+  train_sets:                   # 訓練用的「年份 + 切分」，可列多組，會合併成一個資料集
+    - {year: "2007", split: trainval}   # 讀 VOC2007/ImageSets/Main/trainval.txt
+    - {year: "2012", split: trainval}   # 07+12 trainval 共 16,551 張（偵測的標準設定）
+  val_sets:                     # 評估用的切分
+    - {year: "2007", split: test}       # VOC2007 test 4,952 張（VOC2012 test 沒有公開標註，不能用）
+  use_difficult: false          # 訓練時是否保留標為 difficult 的物件（太小、被遮擋）
+                                # 評估時一律保留，並依 VOC 規則忽略（不算對也不算錯）
+  batch_size: 8                 # 訓練 batch 大小；顯存不足（CUDA out of memory）就調小
+  val_batch_size: 8             # 評估 batch 大小（不需要存梯度，可比訓練大）
+  num_workers: 2                # 讀圖的子行程數量；Colab 只有 2 顆 CPU，設 2 即可，除錯時可設 0
+  pin_memory: true              # 加快 CPU → GPU 的傳輸，通常保持 true
+  val_max_samples: 1000         # 訓練中的定期評估只跑前 N 張（完整 test 要好幾分鐘）
+                                # null = 每次都跑完整驗證集；訓練結束時一定會跑一次完整的
+
+  augment:                      # 資料增強（只在訓練時套用）
+    hflip_prob: 0.5             # 水平翻轉的機率；0 = 不翻轉
+    photometric: true           # 隨機調整亮度、對比、飽和度、色相
+    # 偵測的影像縮放由模型內部處理：短邊縮放到 min_size，長邊不超過 max_size
+    min_size: [480, 512, 544, 576, 608]
+                                # 訓練時每個 batch 隨機選一個短邊長度（多尺度訓練，提升對大小變化的穩健度）
+                                # 只寫一個值（例如 [544]）就是固定尺寸；越大越準但越慢、越吃顯存
+    max_size: 1000              # 長邊上限
+    test_min_size: 544          # 評估與推論時使用的短邊長度
+    # 以下欄位只有語意分割會用到，偵測會忽略（設定方式見 configs/segmentation.yaml）：
+    # base_size、scale_range、crop_size
+
+
+# -----------------------------------------------------------------------------
+# model：模型 = backbone（擷取特徵）→ neck（整理特徵）→ head（輸出答案）
+# -----------------------------------------------------------------------------
+model:
+  # ---- backbone：從影像擷取特徵的主幹網路，使用 timm 的預訓練模型 ----
+  backbone:
+    name: resnet50.a1_in1k      # timm 模型名稱，「.」後面是權重版本，例如：
+                                #   CNN：  resnet50.a1_in1k、resnet50.tv2_in1k、resnet101.a1h_in1k
+                                #          convnext_tiny.fb_in22k_ft_in1k、efficientnet_b3.ra2_in1k
+                                #   ViT：  vit_small_patch16_224.dino（DINO）
+                                #          vit_small_patch14_dinov2.lvd142m（DINOv2）
+                                #          vit_small_patch16_dinov3.lvd1689m（DINOv3）
+                                #   自監督 CNN：convnext_tiny.dinov3_lvd1689m
+                                # 查詢可用權重：python -c "import timm; print(timm.list_pretrained('*resnet*'))"
+                                # ⚠ ViT 的 neck 要改成 simple_pyramid（見檔案最後的常見組合）
+    pretrained: true            # 是否下載 timm 預訓練權重；VOC 資料量小，強烈建議 true
+    checkpoint: null            # 外部權重（本機路徑或 URL），用於 timm 沒有的權重，例如 DINO ResNet-50：
+                                #   https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth
+                                # 設定後會忽略 pretrained
+    checkpoint_key: null        # 權重存在外部 checkpoint 的哪個 key 底下，例如 teacher、model；null = 整個檔案就是權重
+    out_indices: [2, 3, 4]      # 要輸出哪幾個 stage 的特徵（CNN 共 5 個，索引 0–4）
+                                #   索引：   0     1     2     3     4
+                                #   stride：2     4     8     16    32   （特徵圖比原圖縮小的倍數）
+                                #   ResNet-50 通道數：64、256、512、1024、2048
+                                # FCOS / RetinaNet 用 [2, 3, 4]；Faster R-CNN 用 [1, 2, 3, 4]
+                                # ViT 只有一種 stride，索引代表第幾個 block，例如 ViT-S 共 12 個 block，最後一個是 [11]
+    freeze: false               # true = 凍結整個 backbone 只訓練 neck 和 head（快，但準確度較低）
+    freeze_bn: true             # 把 BatchNorm 固定成預訓練時的統計值
+                                # 偵測 batch 小（每張 GPU 8 張），BN 統計不穩，建議 true
+    mean: null                  # 影像正規化（(影像 - mean) / std）用的平均值與標準差
+    std: null                   # ⚠ 一定會做正規化，只是在模型內部做（資料管線輸出 [0, 1] 的影像）
+                                # null = 自動採用預訓練權重當初訓練時的數值，例如：
+                                #   ImageNet / DINO 系列：mean [0.485, 0.456, 0.406]、std [0.229, 0.224, 0.225]
+                                #   augreg ViT：         mean [0.5, 0.5, 0.5]、        std [0.5, 0.5, 0.5]
+                                # 只有用 checkpoint 載入外部權重時，timm 不知道數值，才需要手動填
+    kwargs: {}                  # 其他直接傳給 timm.create_model 的參數，例如：
+                                #   {drop_path_rate: 0.1}   隨機丟棄殘差分支，ViT / ConvNeXt 常用的正則化
+                                #   {output_stride: 16}     CNN 最後一層改用 dilation，特徵圖較大（分割常用）
+
+  # ---- neck：把 backbone 的特徵整理成 head 需要的格式 ----
+  neck:
+    name: fpn                   # fpn | simple_pyramid | none
+                                #   fpn            Feature Pyramid Network：把 CNN 不同 stride 的特徵由粗到細融合，
+                                #                  讓每一層都同時有語意與細節，並統一通道數。CNN backbone 用這個
+                                #   simple_pyramid ViTDet 作法：ViT 只有單一 stride 的特徵，
+                                #                  用反卷積放大、池化縮小，做出多種 stride。ViT backbone 用這個
+                                #   none           不處理；偵測 head 需要通道數一致的多層特徵，所以偵測不能用
+    out_channels: 256           # neck 輸出每一層的通道數
+    extra_levels: p6p7          # 在最粗的一層之後再往下加層，用來偵測更大的物體
+                                #   none     不加
+                                #   maxpool  加 1 層（池化），Faster R-CNN 用
+                                #   p6p7     加 2 層（卷積），RetinaNet / FCOS 用
+                                # 目前：C3–C5（stride 8/16/32）+ P6、P7 → 共 5 層，stride 8–128
+    scales: [4.0, 2.0, 1.0, 0.5]
+                                # 只有 simple_pyramid 使用：對 ViT 特徵的縮放倍率，每個值產生一層
+                                #   4 = 放大 4 倍、2 = 放大 2 倍、1 = 原尺寸、0.5 = 縮小一半
+                                # ViT stride 16 時：[4, 2, 1, 0.5] → stride 4/8/16/32（Faster R-CNN）
+                                #                  [2, 1, 0.5]    → stride 8/16/32（FCOS / RetinaNet）
+
+  # ---- head：根據特徵輸出最終答案（偵測 = 框 + 類別 + 分數），使用 torchvision 的實作 ----
+  head:
+    name: fcos                  # faster_rcnn | retinanet | fcos
+                                #   faster_rcnn  兩階段：先提出候選框，再逐一分類與修正。準、較慢
+                                #   retinanet    單階段 + 預設框（anchor），Focal Loss 處理前景／背景不平衡
+                                #   fcos         單階段、不需要 anchor：每個位置直接預測到物體四邊的距離。
+                                #                設定少、表現好，推薦入門
+    num_classes: 21             # 類別數 = VOC 20 類 + 背景 1 類，換資料集才需要改
+    kwargs:                     # 直接傳給 torchvision 模型的參數；⚠ 各 head 可用的參數名稱不同，換 head 時要一起改
+      score_thresh: 0.05        # 分數低於此值的框直接丟掉；算 mAP 要保留低分框，建議 0.05
+      nms_thresh: 0.6           # NMS：IoU 超過此值的重疊框只留分數最高的
+      detections_per_img: 100   # 每張圖最多輸出幾個框
+      topk_candidates: 1000     # 每一層先取分數最高的 N 個位置再做 NMS
+      center_sampling_radius: 1.5  # 訓練時，物體中心多大範圍內的位置算正樣本（單位：stride）
+      # ---- retinanet 可用的參數（預設值）----
+      # score_thresh: 0.05、nms_thresh: 0.5、detections_per_img: 300、topk_candidates: 1000
+      # fg_iou_thresh: 0.5      anchor 與真實框 IoU ≥ 此值算前景
+      # bg_iou_thresh: 0.4      IoU < 此值算背景，中間的忽略
+      # ---- faster_rcnn 可用的參數（預設值）----
+      # box_score_thresh: 0.05、box_nms_thresh: 0.5、box_detections_per_img: 100
+      # rpn_pre_nms_top_n_train: 2000、rpn_post_nms_top_n_train: 2000   訓練時 RPN 保留的候選框數
+      # rpn_pre_nms_top_n_test: 1000、rpn_post_nms_top_n_test: 1000     推論時 RPN 保留的候選框數
+      # rpn_nms_thresh: 0.7、rpn_fg_iou_thresh: 0.7、rpn_bg_iou_thresh: 0.3
+      # rpn_batch_size_per_image: 256、rpn_positive_fraction: 0.5        每張圖抽多少 anchor 算 RPN loss
+      # box_fg_iou_thresh: 0.5、box_bg_iou_thresh: 0.5
+      # box_batch_size_per_image: 512、box_positive_fraction: 0.25      每張圖抽多少候選框算分類 loss
+
+
+# -----------------------------------------------------------------------------
+# optim：優化器（怎麼依梯度更新權重）
+# -----------------------------------------------------------------------------
+optim:
+  name: sgd                     # sgd | adam | adamw
+                                #   sgd    CNN 偵測／分割的傳統選擇，搭配 momentum
+                                #   adamw  ViT 與 Transformer 類模型的標準選擇
+  lr: 0.005                     # 學習率；常見經驗：SGD batch 16 用 0.01，batch 減半 lr 也減半
+                                # AdamW 通常 1e-4 左右
+  weight_decay: 1.0e-4          # 權重衰減（L2 正則化）；SGD 常用 1e-4，AdamW 常用 0.05
+  momentum: 0.9                 # 只有 sgd 使用：沿用前幾步更新方向的比例
+  nesterov: false               # 只有 sgd 使用：Nesterov momentum
+  betas: [0.9, 0.999]           # 只有 adam / adamw 使用：一階、二階動量的衰減率
+  eps: 1.0e-8                   # 只有 adam / adamw 使用：避免除以 0 的小常數
+  backbone_lr_mult: 1.0         # backbone 的學習率 = lr × 此倍率
+                                # 預訓練權重已經很好，可設 0.1 讓 backbone 少變動（微調 ViT 常用）
+  no_weight_decay_norm_bias: true
+                                # norm 層、bias、ViT 位置編碼不做 weight decay（常見作法，通常保持 true）
+
+
+# -----------------------------------------------------------------------------
+# scheduler：學習率排程（學習率隨訓練進度怎麼變化），全部以 optimizer step 計算
+# -----------------------------------------------------------------------------
+scheduler:
+  name: multistep               # constant | cosine | multistep | step | poly
+                                #   constant   固定不變
+                                #   cosine     依餘弦曲線平滑下降到 min_lr_ratio
+                                #   multistep  到 milestones 時乘上 gamma（偵測的經典作法）
+                                #   step       每隔 step_size 乘上 gamma
+                                #   poly       (1 - 進度)^power 下降（分割的經典作法）
+  warmup_steps: 1000            # 前 N 步學習率從 lr × warmup_start_factor 線性升到 lr，避免一開始梯度太大
+  warmup_start_factor: 0.001    # warmup 起始倍率
+  min_lr_ratio: 0.0             # cosine / poly 使用：最後的學習率 = lr × 此值
+  milestones: [0.67, 0.89]      # multistep 使用：在總 step 的 67%、89% 時降學習率（用比例，改訓練長度不必重算）
+  step_size: 0.33               # step 使用：每隔總 step 的 33% 降一次
+  gamma: 0.1                    # multistep / step 使用：每次降學習率乘上的倍率
+  power: 0.9                    # poly 使用：指數
+
+
+# -----------------------------------------------------------------------------
+# train：訓練迴圈
+# -----------------------------------------------------------------------------
+train:
+  max_steps: null               # 總訓練步數（一步 = 一次權重更新）；設定後會忽略 max_epochs
+  max_epochs: 12                # 總訓練 epoch 數（一個 epoch = 所有訓練圖片看過一遍）
+                                # 07+12、batch 8：每 epoch 約 2,068 步，12 epoch 約 24,800 步
+  grad_accum_steps: 1           # 梯度累積：累積 N 個 batch 才更新一次，等效 batch = batch_size × N
+                                # 顯存不夠又想要大 batch 時使用（例如 batch_size 4 + accum 2 ≈ batch 8）
+  grad_clip_norm: 10.0          # 梯度範數上限，防止梯度爆炸；null = 不限制。ViT 常用 1.0
+  precision: fp16               # fp16 | bf16 | fp32
+                                #   fp16  混合精度，快且省顯存，T4 請用這個
+                                #   bf16  數值較穩，但需要 A100 / L4 等新 GPU（T4 設了會自動改 fp16）
+                                #   fp32  全精度，最慢，除錯用
+  log_every_steps: 20           # 每 N 步寫一次 loss、學習率到 TensorBoard 與畫面
+  eval_every_steps: 2000        # 每 N 步評估一次（只跑 data.val_max_samples 張）
+  cudnn_benchmark: false        # 讓 cuDNN 針對輸入尺寸挑最快的演算法
+                                # 只有輸入尺寸固定時有幫助；偵測尺寸會變，保持 false
+  device: auto                  # auto（有 GPU 就用）| cuda | cpu
+
+
+# -----------------------------------------------------------------------------
+# checkpoint：存檔與續訓
+# -----------------------------------------------------------------------------
+checkpoint:
+  save_every_steps: 500         # 每 N 步存一次 checkpoint 到 <output_root>/<name>/checkpoints/
+  keep_last: 3                  # 只保留最新的 N 個（每個約 200–500MB，注意 Drive 空間）
+  resume: auto                  # auto  啟動時自動找最新的 checkpoint 接著訓練，沒有就從頭開始
+                                # none  永遠從頭開始（建議同時改 experiment.name，以免和舊的 checkpoint 混在一起）
+                                # 或填 checkpoint 路徑，從指定的檔案續訓
+  save_best: true               # 另外存一份指標最好的模型 best.pt
+  monitor: val/mAP50            # 用哪個指標決定 best：val/mAP50 | val/mAP50_95 | val/mAP50_voc07
+  monitor_mode: max             # max = 越大越好 | min = 越小越好
+  local_tmp_dir: null           # 存檔時先寫到這個本機目錄再複製到 Drive；null = 系統暫存目錄
+
+
+# -----------------------------------------------------------------------------
+# logging：TensorBoard 視覺化
+# -----------------------------------------------------------------------------
+logging:
+  num_vis_samples: 4            # 每次評估時，畫幾張預測結果到 TensorBoard（val_vis/）
+
+
+# =============================================================================
+# 常見組合：要換模型時，把下面對應的設定改到上面（或用命令列覆寫）
+# 換組合時記得同時改 experiment.name，避免接到舊實驗的 checkpoint
+# =============================================================================
+#
+# 【Faster R-CNN + ResNet-50】
+#   model.backbone.out_indices: [1, 2, 3, 4]       # 從 stride 4 開始
+#   model.neck.extra_levels: maxpool
+#   model.head.name: faster_rcnn
+#   model.head.kwargs: {box_score_thresh: 0.05}    # ⚠ 參數名稱和 fcos 不同
+#   optim.lr: 0.01
+#
+# 【RetinaNet + ResNet-50】
+#   model.head.name: retinanet
+#   model.head.kwargs: {score_thresh: 0.05, detections_per_img: 100}
+#
+# 【DINO 自監督 ResNet-50】（timm 沒有，從官方網址載入）
+#   model.backbone.name: resnet50
+#   model.backbone.pretrained: false
+#   model.backbone.checkpoint: https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth
+#   model.backbone.mean: [0.485, 0.456, 0.406]
+#   model.backbone.std: [0.229, 0.224, 0.225]
+#
+# 【ConvNeXt-T】（CNN，可直接接 FPN；stage 只有 4 個，索引 0–3 對應 stride 4/8/16/32）
+#   model.backbone.name: convnext_tiny.fb_in22k_ft_in1k
+#   model.backbone.out_indices: [1, 2, 3]
+#   model.backbone.kwargs: {drop_path_rate: 0.1}
+#   optim: {name: adamw, lr: 1.0e-4, weight_decay: 0.05}
+#
+# 【DINO ViT-S/16 + Simple Feature Pyramid】（ViT，DINOv3 改名稱為 vit_small_patch16_dinov3.lvd1689m）
+#   data.augment.min_size: [448, 480, 512, 544, 576]
+#   data.augment.max_size: 960
+#   data.augment.test_min_size: 512
+#   model.backbone.name: vit_small_patch16_224.dino
+#   model.backbone.out_indices: [11]              # 最後一個 block
+#   model.backbone.kwargs: {drop_path_rate: 0.1}
+#   model.neck.name: simple_pyramid
+#   model.neck.scales: [2.0, 1.0, 0.5]            # stride 8/16/32，再加 p6p7
+#   optim: {name: adamw, lr: 1.0e-4, weight_decay: 0.05, backbone_lr_mult: 0.1}
+#   scheduler.name: cosine
+#   train.grad_clip_norm: 1.0

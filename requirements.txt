@@ -1,0 +1,8 @@
+# Colab 已內建 torch 與 torchvision，這裡刻意不列出：
+# 重新安裝不但耗時，還可能裝到與 Colab CUDA 版本不符的套件。
+# 本機開發請先依 https://pytorch.org 安裝 torch>=2.4、torchvision>=0.19。
+timm>=1.0.20        # DINOv3 權重需要 1.0.20 以上
+omegaconf>=2.3
+tensorboard>=2.15
+numpy
+pillow
