@@ -7,9 +7,9 @@ __pycache__/
 .venv/
 
 # 資料集與訓練輸出（放在 Google Drive，不進 git）
-data/
-outputs/
-runs/
+/data/
+/outputs/
+/runs/
 *.zip
 *.pt
 *.pth
